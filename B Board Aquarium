@@ -1,0 +1,115 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+
+#define SCREEN_W 128
+#define SCREEN_H 64
+#define VIRTUAL_W 256
+#define SAND_Y 56
+
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+
+typedef struct {
+  float f1x, f1y; int8_t f1dir; uint8_t f1tail;
+  float f2x, f2y; int8_t f2dir; uint8_t f2tail;
+  float snailX;   int8_t snailDir;
+  uint32_t bubbleSeed;
+  uint8_t magic;
+} TankPacket;
+
+TankPacket pkt;
+bool haveData = false;
+
+struct Plant { int x; int h; };
+Plant plantsB[] = { {20, 16}, {60, 22}, {100, 11}, {0, 20} };
+const int NUM_PLANTS_B = 4;
+
+void drawSand(Adafruit_SSD1306 &d) {
+  d.fillRect(0, SAND_Y, SCREEN_W, SCREEN_H - SAND_Y, SSD1306_WHITE);
+}
+
+void drawPlants(Adafruit_SSD1306 &d, Plant* plants, int n, uint32_t t, float phase) {
+  for (int i = 0; i < n; i++) {
+    int px = plants[i].x;
+    float sway = sinf((t / 800.0f) + i + phase) * 2.0f;
+    d.drawLine(px, SAND_Y, px + (int)sway, SAND_Y - plants[i].h, SSD1306_WHITE);
+    d.drawLine(px + (int)sway, SAND_Y - plants[i].h,
+               px + (int)sway + 3, SAND_Y - plants[i].h + 3, SSD1306_WHITE);
+  }
+}
+
+void drawBubbles(Adafruit_SSD1306 &d, uint32_t seed, uint32_t t, int xOffset) {
+  for (int i = 0; i < 5; i++) {
+    int bx = ((seed * (i + 3) * 37) % VIRTUAL_W) + xOffset;
+    int by = 58 - ((t / 14 + i * 19) % 58);
+    if (bx >= 0 && bx < SCREEN_W) {
+      d.drawPixel(bx, by, SSD1306_WHITE);
+      d.drawPixel(bx + 1, by, SSD1306_WHITE);
+    }
+  }
+}
+
+void drawFish(Adafruit_SSD1306 &d, int x, int y, int dir, uint8_t phase) {
+  d.fillRect(x - 4, y - 2, 8, 4, SSD1306_WHITE);
+  d.fillRect(x - 2, y - 3, 5, 6, SSD1306_WHITE);
+  d.drawPixel(x + (dir > 0 ? 2 : -2), y - 1, SSD1306_BLACK);
+  int flap = (phase & 0x40) ? 1 : -1;
+  if (dir > 0) {
+    d.drawLine(x - 4, y, x - 7, y - 2 - flap, SSD1306_WHITE);
+    d.drawLine(x - 4, y, x - 7, y + 2 + flap, SSD1306_WHITE);
+    d.drawLine(x - 7, y - 2 - flap, x - 7, y + 2 + flap, SSD1306_WHITE);
+  } else {
+    d.drawLine(x + 4, y, x + 7, y - 2 - flap, SSD1306_WHITE);
+    d.drawLine(x + 4, y, x + 7, y + 2 + flap, SSD1306_WHITE);
+    d.drawLine(x + 7, y - 2 - flap, x + 7, y + 2 + flap, SSD1306_WHITE);
+  }
+}
+
+void drawSnail(Adafruit_SSD1306 &d, int x, int dir) {
+  int y = SAND_Y - 1;
+  d.drawLine(x - 3, y, x + 3, y, SSD1306_WHITE);
+  d.fillCircle(x, y - 2, 2, SSD1306_WHITE);
+  int e = (dir > 0) ? 3 : -3;
+  d.drawPixel(x + e, y - 2, SSD1306_WHITE);
+  d.drawPixel(x + e, y - 3, SSD1306_WHITE);
+}
+
+void onReceive(const esp_now_recv_info_t*, const uint8_t* data, int len) {
+  if (len != sizeof(TankPacket)) return;
+  TankPacket* p = (TankPacket*)data;
+  if (p->magic != 0x42) return;
+  pkt = *p;
+  haveData = true;
+}
+
+void setup() {
+  Wire.begin(7, 6);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay(); display.display();
+
+  WiFi.mode(WIFI_STA);
+  esp_now_init();
+  esp_now_register_recv_cb(onReceive);
+}
+
+void loop() {
+  uint32_t t = millis();
+  display.clearDisplay();
+
+  if (haveData) {
+    drawPlants(display, plantsB, NUM_PLANTS_B, t, 3.0f);
+
+    // everything virtual gets -128
+    drawSnail(display, (int)pkt.snailX - 128, pkt.snailDir);
+    drawFish(display, (int)pkt.f1x - 128, (int)pkt.f1y, pkt.f1dir, pkt.f1tail);
+    drawFish(display, (int)pkt.f2x - 128, (int)pkt.f2y, pkt.f2dir, pkt.f2tail);
+    drawBubbles(display, pkt.bubbleSeed, t, -128);
+  }
+
+  drawSand(display);
+  display.display();
+  delay(40);
+}
