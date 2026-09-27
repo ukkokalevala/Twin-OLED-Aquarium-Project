@@ -1,0 +1,159 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+
+#define SCREEN_W 128
+#define SCREEN_H 64
+#define VIRTUAL_W 256
+#define SAND_Y 56
+
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+uint8_t broadcastMAC[] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+typedef struct {
+  float f1x, f1y; int8_t f1dir; uint8_t f1tail;
+  float f2x, f2y; int8_t f2dir; uint8_t f2tail;
+  float snailX;   int8_t snailDir;
+  uint32_t bubbleSeed;
+  uint8_t magic;
+} TankPacket;
+
+TankPacket pkt = {
+  20.0f, 30.0f, 1, 0,     // fish 1
+  200.0f, 20.0f, -1, 0,   // fish 2
+  60.0f, 1,               // snail
+  0, 0x42
+};
+
+// ---------- decorations ----------
+struct Plant { int x; int h; };
+Plant plantsA[] = { {18, 14}, {75, 20}, {112, 12}, {127, 20} };
+const int NUM_PLANTS_A = 4;
+
+void drawSand(Adafruit_SSD1306 &d) {
+  d.fillRect(0, SAND_Y, SCREEN_W, SCREEN_H - SAND_Y, SSD1306_WHITE);
+}
+
+void drawPlants(Adafruit_SSD1306 &d, Plant* plants, int n, uint32_t t, float phase) {
+  for (int i = 0; i < n; i++) {
+    int px = plants[i].x;
+    float sway = sinf((t / 800.0f) + i + phase) * 2.0f;
+    d.drawLine(px, SAND_Y, px + (int)sway, SAND_Y - plants[i].h, SSD1306_WHITE);
+    d.drawLine(px + (int)sway, SAND_Y - plants[i].h,
+               px + (int)sway + 3, SAND_Y - plants[i].h + 3, SSD1306_WHITE);
+  }
+}
+
+void drawBubbles(Adafruit_SSD1306 &d, uint32_t seed, uint32_t t, int xOffset) {
+  for (int i = 0; i < 5; i++) {
+    int bx = ((seed * (i + 3) * 37) % VIRTUAL_W) + xOffset;
+    int by = 58 - ((t / 14 + i * 19) % 58);
+    if (bx >= 0 && bx < SCREEN_W) {
+      d.drawPixel(bx, by, SSD1306_WHITE);
+      d.drawPixel(bx + 1, by, SSD1306_WHITE);
+    }
+  }
+}
+
+void drawFish(Adafruit_SSD1306 &d, int x, int y, int dir, uint8_t phase) {
+  d.fillRect(x - 4, y - 2, 8, 4, SSD1306_WHITE);
+  d.fillRect(x - 2, y - 3, 5, 6, SSD1306_WHITE);
+  d.drawPixel(x + (dir > 0 ? 2 : -2), y - 1, SSD1306_BLACK);
+  int flap = (phase & 0x40) ? 1 : -1;
+  if (dir > 0) {
+    d.drawLine(x - 4, y, x - 7, y - 2 - flap, SSD1306_WHITE);
+    d.drawLine(x - 4, y, x - 7, y + 2 + flap, SSD1306_WHITE);
+    d.drawLine(x - 7, y - 2 - flap, x - 7, y + 2 + flap, SSD1306_WHITE);
+  } else {
+    d.drawLine(x + 4, y, x + 7, y - 2 - flap, SSD1306_WHITE);
+    d.drawLine(x + 4, y, x + 7, y + 2 + flap, SSD1306_WHITE);
+    d.drawLine(x + 7, y - 2 - flap, x + 7, y + 2 + flap, SSD1306_WHITE);
+  }
+}
+
+// Snail sitting on the sand. Body ~5 px long, shell ~3 px.
+void drawSnail(Adafruit_SSD1306 &d, int x, int dir) {
+  int y = SAND_Y - 1;
+  // body
+  d.drawLine(x - 3, y, x + 3, y, SSD1306_WHITE);
+  // shell
+  d.fillCircle(x, y - 2, 2, SSD1306_WHITE);
+  // eye stalks (tiny)
+  int e = (dir > 0) ? 3 : -3;
+  d.drawPixel(x + e, y - 2, SSD1306_WHITE);
+  d.drawPixel(x + e, y - 3, SSD1306_WHITE);
+}
+
+void onSent(const wifi_tx_info_t*, esp_now_send_status_t) {}
+
+void setup() {
+  Wire.begin(7, 6);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay(); display.display();
+
+  WiFi.mode(WIFI_STA);
+  esp_now_init();
+  esp_now_register_send_cb(onSent);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, broadcastMAC, 6);
+  peer.channel = 0; peer.encrypt = false;
+  esp_now_add_peer(&peer);
+}
+
+void loop() {
+  uint32_t t = millis();
+
+  // ---------- Fish 1 physics ----------
+  pkt.f1x += pkt.f1dir * 0.8f;
+  pkt.f1y += sinf(t / 500.0f) * 0.2f;
+  if (pkt.f1y < 6) pkt.f1y = 6;
+  if (pkt.f1y > 50) pkt.f1y = 50;
+  if (pkt.f1x < 6) { pkt.f1x = 6; pkt.f1dir = 1; }
+  if (pkt.f1x > VIRTUAL_W - 6) { pkt.f1x = VIRTUAL_W - 6; pkt.f1dir = -1; }
+  pkt.f1tail += 8;
+
+  // ---------- Fish 2 physics (different phase and speed) ----------
+  pkt.f2x += pkt.f2dir * 0.55f;
+  pkt.f2y += sinf(t / 700.0f + 2.0f) * 0.15f;
+  if (pkt.f2y < 8) pkt.f2y = 8;
+  if (pkt.f2y > 48) pkt.f2y = 48;
+  if (pkt.f2x < 6) { pkt.f2x = 6; pkt.f2dir = 1; }
+  if (pkt.f2x > VIRTUAL_W - 6) { pkt.f2x = VIRTUAL_W - 6; pkt.f2dir = -1; }
+  pkt.f2tail += 6;
+
+  // occasional random turn for each fish
+  if (random(400) == 0) pkt.f1dir = -pkt.f1dir;
+  if (random(600) == 0) pkt.f2dir = -pkt.f2dir;
+
+  // ---------- Snail physics ----------
+  // Very slow. Ticks only every other frame to feel deliberate.
+  static int snailTick = 0;
+  if (++snailTick >= 3) {           // every ~120 ms
+    snailTick = 0;
+    pkt.snailX += pkt.snailDir * 0.15f;
+    if (pkt.snailX < 4) { pkt.snailX = 4; pkt.snailDir = 1; }
+    if (pkt.snailX > VIRTUAL_W - 4) { pkt.snailX = VIRTUAL_W - 4; pkt.snailDir = -1; }
+  }
+
+  pkt.bubbleSeed = t / 2000;
+
+  // ---------- Broadcast ----------
+  esp_now_send(broadcastMAC, (uint8_t*)&pkt, sizeof(pkt));
+
+  // ---------- Render left half ----------
+  display.clearDisplay();
+
+  drawPlants(display, plantsA, NUM_PLANTS_A, t, 0.0f);
+  drawSnail(display, (int)pkt.snailX, pkt.snailDir);
+  drawFish(display, (int)pkt.f1x, (int)pkt.f1y, pkt.f1dir, pkt.f1tail);
+  drawFish(display, (int)pkt.f2x, (int)pkt.f2y, pkt.f2dir, pkt.f2tail);
+  drawBubbles(display, pkt.bubbleSeed, t, 0);
+  drawSand(display);
+
+  display.display();
+  delay(40);
+}
